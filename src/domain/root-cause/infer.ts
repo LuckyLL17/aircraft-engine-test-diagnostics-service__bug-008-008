@@ -1,44 +1,70 @@
 import { invariant } from '../errors.ts';
 import type { CausalEdge, CausalObservation, RootCauseResult } from '../types.ts';
 
-type Traversal = { path: string[]; score: number };
+type Traversal = {
+  path: string[];
+  weight: number;
+  delayMs: number;
+};
 
-function findPaths(start: string, edges: CausalEdge[], seen: string[] = []): Traversal[] {
-  const nextSeen = [...seen, start];
-  const incoming = edges.filter((edge) => edge.to === start);
-  if (!incoming.length) return [{ path: nextSeen, score: 1 }];
-  return incoming.flatMap((edge) => {
-    if (nextSeen.includes(edge.from)) return [{ path: [...nextSeen, edge.from], score: edge.weight }];
-    return findPaths(edge.from, edges, nextSeen).map((item) => ({ path: item.path, score: item.score * edge.weight }));
-  });
+function traceBackward(
+  node: string,
+  edges: CausalEdge[],
+  seen: string[],
+  rejectedCycles: string[][],
+): Traversal[] {
+  const path = [...seen, node];
+  const incoming = edges.filter((edge) => edge.to === node);
+
+  if (incoming.length === 0) return [{ path, weight: 1, delayMs: 0 }];
+
+  const paths: Traversal[] = [];
+  for (const edge of incoming) {
+    if (path.includes(edge.from)) {
+      // Keep the complete backward trace, including the edge that closes the loop.
+      rejectedCycles.push([...path, edge.from]);
+      continue;
+    }
+
+    for (const upstream of traceBackward(edge.from, edges, path, rejectedCycles)) {
+      paths.push({
+        path: upstream.path,
+        weight: upstream.weight * edge.weight,
+        delayMs: upstream.delayMs + edge.delayMs,
+      });
+    }
+  }
+  return paths;
 }
 
-function rankPath(path: string[], observation: CausalObservation, score: number): { node: string; score: number; path: string[] } {
-  const distancePenalty = 1 / Math.max(1, path.length - 1);
-  return { node: path[0], score: observation.score * score * distancePenalty, path };
+function scorePath(observation: CausalObservation, traversal: Traversal): number {
+  const distance = traversal.path.length - 1;
+  const distanceFactor = 1 / Math.max(1, distance);
+  const delayFactor = Math.exp(-traversal.delayMs / 1000);
+  return observation.score * traversal.weight * distanceFactor * delayFactor;
 }
 
 export function inferRootCauses(observations: CausalObservation[], edges: CausalEdge[]): RootCauseResult {
   for (const observation of observations) invariant(observation.score >= 0 && observation.score <= 1, 'INVALID_OBSERVATION_SCORE', 'Observation score must be in [0, 1]', { id: observation.id });
   for (const edge of edges) invariant(edge.weight > 0 && edge.weight <= 1 && edge.delayMs >= 0, 'INVALID_CAUSAL_EDGE', 'Causal edge has invalid weight or delay', { edge });
+
   const rejectedCycles: string[][] = [];
-  const rankedPaths: Array<{ node: string; score: number; path: string[] }> = [];
+  const merged = new Map<string, { score: number; paths: string[][] }>();
+
   for (const observation of observations) {
-    const paths = findPaths(observation.node, edges);
-    for (const path of paths) {
-      if (new Set(path.path).size !== path.path.length) {
-        rejectedCycles.push(path.path);
-        continue;
-      }
-      rankedPaths.push(rankPath(path.path, observation, path.score));
+    const paths = traceBackward(observation.node, edges, [], rejectedCycles);
+    for (const traversal of paths) {
+      const rootCause = traversal.path[traversal.path.length - 1];
+      const current = merged.get(rootCause) ?? { score: 0, paths: [] };
+      current.score += scorePath(observation, traversal);
+      current.paths.push(traversal.path);
+      merged.set(rootCause, current);
     }
   }
-  const scores = new Map<string, { score: number; paths: string[][] }>();
-  for (const item of rankedPaths) {
-    const current = scores.get(item.node) ?? { score: 0, paths: [] };
-    current.score += item.score;
-    current.paths.push(item.path);
-    scores.set(item.node, current);
-  }
-  return { ranking: [...scores.entries()].map(([node, value]) => ({ node, score: value.score, paths: value.paths })).sort((a, b) => b.score - a.score || a.node.localeCompare(b.node)), observations, rejectedCycles };
+
+  const ranking = [...merged.entries()]
+    .map(([node, value]) => ({ node, score: value.score, paths: value.paths }))
+    .sort((a, b) => b.score - a.score || a.node.localeCompare(b.node));
+
+  return { ranking, observations, rejectedCycles };
 }
